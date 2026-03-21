@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Real Deal Fitness — AB Challenge PP
-// SMS Check-in Server (Express + Twilio + Supabase)
+// WhatsApp + SMS Check-in Server (Express + Twilio + Supabase)
 // ─────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 const express = require('express');
@@ -30,10 +30,28 @@ const supabase = createClient(
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 function normalizePhone(raw = '') {
-  const digits = raw.replace(/\D/g, '');
+  // WhatsApp numbers arrive as "whatsapp:+12345678900" — strip the prefix first
+  const stripped = raw.replace(/^whatsapp:/i, '');
+  const digits   = stripped.replace(/\D/g, '');
   if (digits.length === 10)                      return `+1${digits}`;
   if (digits.length === 11 && digits[0] === '1') return `+${digits}`;
   return `+${digits}`;
+}
+
+function isWhatsApp(raw = '') {
+  return raw.toLowerCase().startsWith('whatsapp:');
+}
+
+// Reply helper — auto-detects WhatsApp vs SMS and formats TwiML accordingly
+function twimlReply(res, message, fromNumber) {
+  const wa = isWhatsApp(fromNumber);
+  res.set('Content-Type', 'text/xml');
+  if (wa) {
+    // WhatsApp responses need the <Message> to include a To back to whatsapp:
+    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${message}</Message></Response>`);
+  } else {
+    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${message}</Message></Response>`);
+  }
 }
 
 function getChallengeDay(startDate) {
@@ -52,10 +70,6 @@ function formatTime(totalSeconds) {
   return `${m}m`;
 }
 
-function twiml(res, message) {
-  res.set('Content-Type', 'text/xml');
-  res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${message}</Message></Response>`);
-}
 
 // ─── LEADERBOARD CALCULATION ─────────────────────────────────────────────────
 
@@ -122,10 +136,12 @@ app.get('/health', (_req, res) =>
   res.json({ status: 'ok', service: 'RDF AB Challenge', ts: new Date().toISOString() })
 );
 
-// ── POST /checkin — Twilio inbound SMS webhook ────────────────────────────────
+// ── POST /checkin — Twilio inbound WhatsApp + SMS webhook ─────────────────────
 app.post('/checkin', async (req, res) => {
-  const phone = normalizePhone(req.body.From || '');
-  const body  = (req.body.Body || '').trim().toUpperCase();
+  const rawFrom = req.body.From || '';
+  const phone   = normalizePhone(rawFrom);
+  const body    = (req.body.Body || '').trim().toUpperCase();
+  const reply   = (msg) => twimlReply(res, msg, rawFrom);
 
   // 1. Look up user
   const { data: user } = await supabase
@@ -135,19 +151,19 @@ app.post('/checkin', async (req, res) => {
     .single();
 
   if (!user) {
-    return twiml(res,
+    return reply(
       `Hey! You're not registered for the AB Challenge yet. ` +
       `Visit ${process.env.APP_URL || '[app URL]'} to sign up. 💪`
     );
   }
 
   if (!user.start_date) {
-    return twiml(res, `Your challenge hasn't started yet. Open the app to begin. 🔥`);
+    return reply(`Your challenge hasn't started yet. Open the app to begin. 🔥`);
   }
 
   // 2. Only accept "DONE"
   if (body !== 'DONE') {
-    return twiml(res,
+    return reply(
       `Text DONE after finishing your workout to log today's check-in. Keep grinding, ${user.name}! 💪`
     );
   }
@@ -169,7 +185,7 @@ app.post('/checkin', async (req, res) => {
     .maybeSingle();
 
   if (existing) {
-    return twiml(res,
+    return reply(
       `You already checked in for Day ${challengeDay} today, ${user.name}! 🏆 ` +
       `Come back tomorrow for Day ${Math.min(challengeDay + 1, 28)}.`
     );
@@ -189,7 +205,7 @@ app.post('/checkin', async (req, res) => {
 
   if (ciErr) {
     console.error('Check-in insert error:', ciErr);
-    return twiml(res, `Something went wrong logging your check-in. Try again in a moment.`);
+    return reply(`Something went wrong logging your check-in. Try again in a moment.`);
   }
 
   // 5. Update leaderboard
@@ -203,18 +219,17 @@ app.post('/checkin', async (req, res) => {
     .single();
 
   const rank = lb?.rank || '?';
-  const days = lb?.completed_days || challengeDay;
 
   // 7. Respond
   if (challengeDay === 28) {
-    return twiml(res,
+    return reply(
       `🏆 YOU FINISHED THE AB CHALLENGE, ${user.name}! ` +
       `28 days complete. Final rank: #${rank}. REAL DEAL. 🔥🔥🔥`
     );
   }
 
   const lateNote = isLate ? ' (logged late)' : '';
-  return twiml(res,
+  return reply(
     `✅ Day ${challengeDay}/28 logged${lateNote}! ` +
     `You're ranked #${rank}, ${user.name}. Week ${week} — keep grinding. 💪`
   );
@@ -318,6 +333,32 @@ app.get('/user/:phone', async (req, res) => {
     completedDays: checkins?.map(c => c.challenge_day) || [],
     leaderboard:   { rank: lb?.rank, consistency: lb?.consistency_score, time: formatTime(lb?.total_time_seconds) },
   });
+});
+
+// ── GET /admin/users — full roster for admin panel ───────────────────────────
+app.get('/admin/users', async (req, res) => {
+  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const { data, error } = await supabase
+    .from('leaderboard')
+    .select(`rank, completed_days, consistency_score, total_time_seconds,
+             users ( name, phone_number, level, start_date, created_at )`)
+    .order('rank');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// ── DELETE /user/:phone — admin: remove a user ────────────────────────────────
+app.delete('/user/:phone', async (req, res) => {
+  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const phone = normalizePhone(req.params.phone);
+  const { error } = await supabase.from('users').delete().eq('phone_number', phone);
+  if (error) return res.status(500).json({ error: error.message });
+  await recalculateRanks();
+  res.json({ success: true });
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────

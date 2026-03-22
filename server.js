@@ -71,6 +71,32 @@ function formatTime(totalSeconds) {
 }
 
 
+// ─── SCORING ─────────────────────────────────────────────────────────────────
+//  Points per workout:
+//    Base 10 pts × streak multiplier
+//    Streak pos in week:  1→×1.0  2→×1.1  3→×1.2  4→×1.3  5→×1.4  6→×1.5  7→×2.0
+//    Every 7 consecutive days: +5 BONUS pts
+//  A missed day resets the streak multiplier back to ×1.0
+function calculateScore(checkinDays) {
+  // checkinDays: sorted array of challenge day numbers e.g. [1,2,3,5,6]
+  let score  = 0;
+  let streak = 0;
+
+  for (let i = 0; i < checkinDays.length; i++) {
+    const day  = checkinDays[i];
+    const prev = i > 0 ? checkinDays[i - 1] : null;
+
+    streak = (prev !== null && day === prev + 1) ? streak + 1 : 1;
+
+    const posInWeek  = ((streak - 1) % 7) + 1;
+    const multiplier = posInWeek === 7 ? 2.0 : 1.0 + (posInWeek - 1) * 0.1;
+    const bonus      = streak % 7 === 0 ? 5 : 0;
+
+    score += Math.round(10 * multiplier) + bonus;
+  }
+  return score;
+}
+
 // ─── LEADERBOARD CALCULATION ─────────────────────────────────────────────────
 
 async function updateLeaderboard(userId, startDate) {
@@ -93,10 +119,13 @@ async function updateLeaderboard(userId, startDate) {
     totalTimeSeconds = Math.floor((new Date(finishedAt) - new Date(startDate)) / 1000);
   }
 
+  const days  = checkins?.map(c => c.challenge_day).sort((a,b) => a-b) || [];
+  const score = calculateScore(days);
+
   await supabase.from('leaderboard').upsert(
     { user_id: userId, completed_days: completedDays, consistency_score: consistency,
       total_time_seconds: totalTimeSeconds, finished_at: finishedAt,
-      updated_at: new Date().toISOString() },
+      score, updated_at: new Date().toISOString() },
     { onConflict: 'user_id' }
   );
 
@@ -106,19 +135,17 @@ async function updateLeaderboard(userId, startDate) {
 async function recalculateRanks() {
   const { data: rows } = await supabase
     .from('leaderboard')
-    .select('user_id, completed_days, total_time_seconds, consistency_score');
+    .select('user_id, completed_days, total_time_seconds, consistency_score, score');
 
   if (!rows?.length) return;
 
-  // Ranking: finishers sorted by speed → then by days done + consistency
+  // Primary: highest score wins. Tiebreak: most days, then fastest finish time.
   const sorted = [...rows].sort((a, b) => {
-    if (a.total_time_seconds && b.total_time_seconds)
-      return a.total_time_seconds - b.total_time_seconds;
-    if (a.total_time_seconds) return -1;
-    if (b.total_time_seconds) return  1;
-    if (b.completed_days !== a.completed_days)
-      return b.completed_days - a.completed_days;
-    return b.consistency_score - a.consistency_score;
+    const sa = a.score || 0, sb = b.score || 0;
+    if (sb !== sa) return sb - sa;
+    if (b.completed_days !== a.completed_days) return b.completed_days - a.completed_days;
+    if (a.total_time_seconds && b.total_time_seconds) return a.total_time_seconds - b.total_time_seconds;
+    return 0;
   });
 
   // Batch-update ranks
@@ -136,14 +163,22 @@ app.get('/health', (_req, res) =>
   res.json({ status: 'ok', service: 'RDF AB Challenge', ts: new Date().toISOString() })
 );
 
-// ── POST /checkin — Twilio inbound WhatsApp + SMS webhook ─────────────────────
+// ── POST /checkin — handles BOTH Twilio WhatsApp/SMS AND in-app JSON check-ins
 app.post('/checkin', async (req, res) => {
+  const isApp   = !req.body.From;                         // app sends JSON; Twilio sends From
   const rawFrom = req.body.From || '';
-  const phone   = normalizePhone(rawFrom);
-  const body    = (req.body.Body || '').trim().toUpperCase();
-  const reply   = (msg) => twimlReply(res, msg, rawFrom);
+  const phone   = isApp ? normalizePhone(req.body.phone || '') : normalizePhone(rawFrom);
+  const reply   = (msg) => isApp ? res.json({ message: msg }) : twimlReply(res, msg, rawFrom);
 
-  // 1. Look up user
+  // 1. Validate "DONE" for WhatsApp (app skips this check)
+  if (!isApp) {
+    const body = (req.body.Body || '').trim().toUpperCase();
+    if (body !== 'DONE') {
+      return reply(`Text DONE after finishing your workout to log today's check-in. Keep grinding! 💪`);
+    }
+  }
+
+  // 2. Look up user
   const { data: user } = await supabase
     .from('users')
     .select('*')
@@ -151,88 +186,79 @@ app.post('/checkin', async (req, res) => {
     .single();
 
   if (!user) {
-    return reply(
-      `Hey! You're not registered for the AB Challenge yet. ` +
-      `Visit ${process.env.APP_URL || '[app URL]'} to sign up. 💪`
-    );
+    if (isApp) return res.status(404).json({ error: 'User not found. Please register first.' });
+    return reply(`Hey! You're not registered yet. Visit ${process.env.APP_URL || '[app URL]'} to sign up. 💪`);
   }
 
   if (!user.start_date) {
     return reply(`Your challenge hasn't started yet. Open the app to begin. 🔥`);
   }
 
-  // 2. Only accept "DONE"
-  if (body !== 'DONE') {
-    return reply(
-      `Text DONE after finishing your workout to log today's check-in. Keep grinding, ${user.name}! 💪`
-    );
-  }
-
-  const challengeDay = getChallengeDay(user.start_date);
+  const challengeDay = isApp ? (parseInt(req.body.day) || getChallengeDay(user.start_date))
+                              : getChallengeDay(user.start_date);
   const week         = Math.ceil(challengeDay / 7);
   const dayOfWeek    = ((challengeDay - 1) % 7) + 1;
 
-  // 3. Check for duplicate check-in today
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
-
-  const { data: existing } = await supabase
+  // 3. 12-hour duplicate guard — one check-in per 12-hour window
+  const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+  const { data: recent } = await supabase
     .from('checkins')
-    .select('id')
+    .select('id, challenge_day, completed_at')
     .eq('user_id', user.id)
-    .eq('challenge_day', challengeDay)
-    .gte('completed_at', todayStart.toISOString())
-    .maybeSingle();
+    .gte('completed_at', twelveHoursAgo)
+    .order('completed_at', { ascending: false })
+    .limit(1);
 
-  if (existing) {
-    return reply(
-      `You already checked in for Day ${challengeDay} today, ${user.name}! 🏆 ` +
-      `Come back tomorrow for Day ${Math.min(challengeDay + 1, 28)}.`
-    );
+  if (recent && recent.length > 0) {
+    const lastCheckin = new Date(recent[0].completed_at);
+    const hoursLeft   = Math.ceil((lastCheckin.getTime() + 12*3600000 - Date.now()) / 3600000);
+    if (isApp) return res.status(429).json({
+      error: `Already logged! Come back in ${hoursLeft}h to log your next workout. 🔥`,
+      hoursLeft
+    });
+    return reply(`You already checked in recently, ${user.name}! Come back in ${hoursLeft}h. 🏆`);
   }
 
   // 4. Log the check-in
-  const expectedTime = new Date(user.start_date).getTime() + (challengeDay - 1) * 86_400_000;
-  const isLate       = Date.now() > expectedTime + 86_400_000;
-
   const { error: ciErr } = await supabase.from('checkins').insert({
     user_id:       user.id,
     week,
     day_of_week:   dayOfWeek,
     challenge_day: challengeDay,
-    is_late:       isLate,
+    is_late:       false,
   });
 
   if (ciErr) {
     console.error('Check-in insert error:', ciErr);
+    if (isApp) return res.status(500).json({ error: 'Check-in failed. Try again.' });
     return reply(`Something went wrong logging your check-in. Try again in a moment.`);
   }
 
   // 5. Update leaderboard
   await updateLeaderboard(user.id, user.start_date);
 
-  // 6. Get updated rank
+  // 6. Get updated rank + score
   const { data: lb } = await supabase
     .from('leaderboard')
-    .select('rank, completed_days')
+    .select('rank, completed_days, score')
     .eq('user_id', user.id)
     .single();
 
-  const rank = lb?.rank || '?';
+  const rank  = lb?.rank  || '?';
+  const score = lb?.score || 0;
 
   // 7. Respond
-  if (challengeDay === 28) {
-    return reply(
-      `🏆 YOU FINISHED THE AB CHALLENGE, ${user.name}! ` +
-      `28 days complete. Final rank: #${rank}. REAL DEAL. 🔥🔥🔥`
-    );
+  if (isApp) {
+    return res.json({ success: true, day: challengeDay, rank, score,
+      message: challengeDay === 28
+        ? `🏆 YOU FINISHED! 28 days complete. Final rank: #${rank}. REAL DEAL!`
+        : `Day ${challengeDay}/28 logged! Rank #${rank} · ${score} pts 🔥` });
   }
 
-  const lateNote = isLate ? ' (logged late)' : '';
-  return reply(
-    `✅ Day ${challengeDay}/28 logged${lateNote}! ` +
-    `You're ranked #${rank}, ${user.name}. Week ${week} — keep grinding. 💪`
-  );
+  if (challengeDay === 28) {
+    return reply(`🏆 YOU FINISHED THE AB CHALLENGE, ${user.name}! 28 days complete. Final rank: #${rank}. REAL DEAL. 🔥🔥🔥`);
+  }
+  return reply(`✅ Day ${challengeDay}/28 logged! Rank #${rank} · ${score} pts. Keep grinding, ${user.name}. 💪`);
 });
 
 // ── POST /register — called from the app's signup screen ─────────────────────
@@ -266,7 +292,7 @@ app.post('/register', async (req, res) => {
 
   // Seed leaderboard row
   await supabase.from('leaderboard').upsert(
-    { user_id: data.id, completed_days: 0, consistency_score: 0, rank: 9999 },
+    { user_id: data.id, completed_days: 0, consistency_score: 0, score: 0, rank: 9999 },
     { onConflict: 'user_id' }
   );
 
@@ -282,6 +308,7 @@ app.get('/leaderboard', async (_req, res) => {
       completed_days,
       total_time_seconds,
       consistency_score,
+      score,
       finished_at,
       users ( name, level )
     `)
@@ -296,6 +323,7 @@ app.get('/leaderboard', async (_req, res) => {
       name:         row.users?.name  || 'Unknown',
       level:        row.users?.level || 'Beginner',
       daysComplete: row.completed_days,
+      score:        row.score || 0,
       time:         formatTime(row.total_time_seconds),
       consistency:  row.consistency_score,
       finished:     !!row.finished_at,

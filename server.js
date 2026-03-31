@@ -402,6 +402,27 @@ app.delete('/user/:phone', async (req, res) => {
   res.json({ success: true });
 });
 
+// ── GET /admin/recalculate?key=ADMINKEY — open in browser to recompute all scores
+app.get('/admin/recalculate', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const { data: users, error } = await supabase.from('users').select('id, name');
+  if (error || !users) return res.status(500).json({ error: 'Failed to fetch users' });
+
+  const results = [];
+  for (const user of users) {
+    try {
+      await updateLeaderboard(user.id);
+      results.push({ name: user.name, status: 'ok' });
+    } catch (e) {
+      results.push({ name: user.name, status: 'error', message: e.message });
+    }
+  }
+  await recalculateRanks();
+  res.json({ recalculated: results.length, results });
+});
+
 // ─── START ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () =>
   console.log(`🔥 RDF AB Challenge server running on port ${PORT}`)

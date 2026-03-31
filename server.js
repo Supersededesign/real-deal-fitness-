@@ -106,8 +106,9 @@ async function updateLeaderboard(userId, startDate) {
     .eq('user_id', userId)
     .order('challenge_day');
 
-  const completedDays = checkins?.length || 0;
-  const maxDay        = checkins?.reduce((m, c) => Math.max(m, c.challenge_day), 0) || 0;
+  const days  = [...new Set(checkins?.map(c => c.challenge_day) || [])].sort((a,b) => a-b);
+  const completedDays = days.length;
+  const maxDay        = days.length > 0 ? Math.max(...days) : 0;
   const consistency   = maxDay > 0 ? Math.round((completedDays / maxDay) * 100) : 0;
 
   let totalTimeSeconds = null;
@@ -119,7 +120,6 @@ async function updateLeaderboard(userId, startDate) {
     totalTimeSeconds = Math.floor((new Date(finishedAt) - new Date(startDate)) / 1000);
   }
 
-  const days  = checkins?.map(c => c.challenge_day).sort((a,b) => a-b) || [];
   const score = calculateScore(days);
 
   await supabase.from('leaderboard').upsert(
@@ -199,7 +199,20 @@ app.post('/checkin', async (req, res) => {
   const week         = Math.ceil(challengeDay / 7);
   const dayOfWeek    = ((challengeDay - 1) % 7) + 1;
 
-  // 3. 12-hour duplicate guard — one check-in per 12-hour window
+  // 3a. Per-day duplicate guard — never allow 2 check-ins for the same challenge day
+  const { data: dayExists } = await supabase
+    .from('checkins')
+    .select('id')
+    .eq('user_id', user.id)
+    .eq('challenge_day', challengeDay)
+    .limit(1);
+
+  if (dayExists && dayExists.length > 0) {
+    if (isApp) return res.status(429).json({ error: `Day ${challengeDay} already logged! Complete tomorrow's workout to advance. 🔥`, hoursLeft: 24 });
+    return reply(`Day ${challengeDay} already logged, ${user.name}! Come back tomorrow. 🏆`);
+  }
+
+  // 3b. 12-hour rolling guard — extra protection against rapid re-submissions
   const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
   const { data: recent } = await supabase
     .from('checkins')
@@ -358,7 +371,7 @@ app.get('/user/:phone', async (req, res) => {
   res.json({
     user:          { name: user.name, level: user.level, startDate: user.start_date },
     challengeDay:  getChallengeDay(user.start_date),
-    completedDays: checkins?.map(c => c.challenge_day) || [],
+    completedDays: [...new Set(checkins?.map(c => c.challenge_day) || [])].sort((a,b)=>a-b),
     leaderboard:   { rank: lb?.rank, consistency: lb?.consistency_score, time: formatTime(lb?.total_time_seconds) },
   });
 });
